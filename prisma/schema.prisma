@@ -6,11 +6,29 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
-
 model User {
-  id        Int      @id @default(autoincrement())
+  id        Int        @id @default(autoincrement())
   fullName  String
-  email     String   @unique
+  email     String     @unique
   password  String
+  createdAt DateTime   @default(now())
+  presets   Preset[]
+  recordings Recording[]
+}
+model Preset {
+  id        Int      @id @default(autoincrement())
+  name      String
+  soundType String
+  settings  Json
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+}
+model Recording {
+  id        Int      @id @default(autoincrement())
+  name      String
+  fileName  String
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
   createdAt DateTime @default(now())
 }
