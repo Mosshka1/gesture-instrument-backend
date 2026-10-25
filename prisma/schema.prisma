@@ -45,6 +45,9 @@ model Sound {
   name      String
   fileName  String
   type      String   // "instrument" (звук для гри рукою) або "background" (фонова петля)
+  author    String?  // автор (для звуків з Freesound)
+  license   String?
+  sourceUrl String?
   userId    Int
   user      User     @relation(fields: [userId], references: [id])
   createdAt DateTime @default(now())

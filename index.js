@@ -485,6 +485,107 @@ app.post('/sounds', authMiddleware, handleSoundUpload, async (req, res) => {
   }
 });
 
+// --- Бібліотека Freesound (ключ лежить тільки в змінній оточення FREESOUND_API_KEY) ---
+
+const FS_BASE = 'https://freesound.org/apiv2';
+const fsPreviewCache = new Map(); // id -> { url, at }
+
+function fsKey() {
+  return process.env.FREESOUND_API_KEY || '';
+}
+
+app.get('/freesound/search', authMiddleware, async (req, res) => {
+  try {
+    if (!fsKey()) return res.status(503).json({ error: 'Бібліотека звуків не налаштована на сервері' });
+    const q = String(req.query.q || '').trim();
+    if (!q) return res.json({ results: [], count: 0 });
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+
+    const params = new URLSearchParams({
+      query: q,
+      page: String(page),
+      page_size: '15',
+      fields: 'id,name,username,license,duration,previews,url',
+      filter: 'duration:[0.1 TO 30] license:("Creative Commons 0" OR "Attribution")',
+      sort: 'score',
+      token: fsKey(),
+    });
+    const r = await fetch(`${FS_BASE}/search/text/?${params}`);
+    if (!r.ok) {
+      console.error('Freesound search', r.status, await r.text());
+      return res.status(502).json({ error: 'Freesound зараз недоступний' });
+    }
+    const data = await r.json();
+    const results = (data.results || []).map((x) => ({
+      id: x.id,
+      name: x.name,
+      author: x.username,
+      license: x.license,
+      duration: x.duration,
+      previewUrl: x.previews && (x.previews['preview-lq-mp3'] || x.previews['preview-hq-mp3']),
+      url: x.url,
+    }));
+    res.json({ results, count: data.count || 0, hasMore: !!data.next });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Щось пішло не так' });
+  }
+});
+
+// Публічний (бо <audio> не вміє слати токен): віддає прев'ю-mp3 звуку з Freesound
+app.get('/freesound/preview/:id', async (req, res) => {
+  try {
+    if (!fsKey()) return res.status(503).end();
+    const id = parseInt(req.params.id);
+    if (!id) return res.status(400).end();
+
+    let cached = fsPreviewCache.get(id);
+    if (!cached) {
+      const r = await fetch(`${FS_BASE}/sounds/${id}/?fields=previews&token=${fsKey()}`);
+      if (!r.ok) return res.status(404).end();
+      const d = await r.json();
+      const url = d.previews && (d.previews['preview-hq-mp3'] || d.previews['preview-lq-mp3']);
+      if (!url) return res.status(404).end();
+      cached = { url };
+      fsPreviewCache.set(id, cached);
+    }
+    const audio = await fetch(cached.url);
+    if (!audio.ok) return res.status(502).end();
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(await audio.arrayBuffer()));
+  } catch (error) {
+    console.error(error);
+    res.status(500).end();
+  }
+});
+
+app.post('/sounds/freesound', authMiddleware, async (req, res) => {
+  try {
+    const { freesoundId, name, type, author, license, sourceUrl } = req.body;
+    const fid = parseInt(freesoundId);
+    if (!fid) return res.status(400).json({ error: 'Невірний звук' });
+    if (!type || !['instrument', 'background'].includes(type)) {
+      return res.status(400).json({ error: 'Вкажи коректний тип звуку' });
+    }
+    const sound = await prisma.sound.create({
+      data: {
+        name: String(name || 'Без назви').slice(0, 120),
+        fileName: `fs:${fid}`,
+        type,
+        author: author ? String(author).slice(0, 120) : null,
+        license: license ? String(license).slice(0, 120) : null,
+        sourceUrl: sourceUrl ? String(sourceUrl).slice(0, 300) : null,
+        userId: req.userId,
+      },
+    });
+    res.json({ sound });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Щось пішло не так' });
+  }
+});
+
 app.delete('/sounds/:id', authMiddleware, async (req, res) => {
   try {
     const soundId = parseInt(req.params.id);
@@ -498,10 +599,12 @@ app.delete('/sounds/:id', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Це не твій звук' });
     }
 
-    const filePath = path.join(__dirname, 'uploads', sound.fileName);
-    fs.unlink(filePath, (err) => {
-      if (err) console.error('Не вдалось видалити файл', err);
-    });
+    if (!sound.fileName.startsWith('fs:')) {
+      const filePath = path.join(__dirname, 'uploads', sound.fileName);
+      fs.unlink(filePath, (err) => {
+        if (err) console.error('Не вдалось видалити файл', err);
+      });
+    }
 
     await prisma.sound.delete({ where: { id: soundId } });
 
