@@ -7,27 +7,44 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 model User {
-  id        Int        @id @default(autoincrement())
-  fullName  String
-  email     String     @unique
-  password  String
-  createdAt DateTime   @default(now())
-  presets   Preset[]
+  id         Int          @id @default(autoincrement())
+  fullName   String
+  email      String       @unique
+  password   String
+  createdAt  DateTime     @default(now())
+  presets    Preset[]
   recordings Recording[]
+  sounds     Sound[]
+  calibration Json?
 }
 model Preset {
   id        Int      @id @default(autoincrement())
   name      String
   soundType String
   settings  Json
+  favorite  Boolean  @default(false)
+  usedCount Int      @default(0)
   userId    Int
   user      User     @relation(fields: [userId], references: [id])
   createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
 }
 model Recording {
   id        Int      @id @default(autoincrement())
   name      String
   fileName  String
+  mode        String?
+  durationSec Int?
+  sizeBytes   Int?
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+}
+model Sound {
+  id        Int      @id @default(autoincrement())
+  name      String
+  fileName  String
+  type      String   // "instrument" (звук для гри рукою) або "background" (фонова петля)
   userId    Int
   user      User     @relation(fields: [userId], references: [id])
   createdAt DateTime @default(now())
