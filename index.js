@@ -356,7 +356,7 @@ app.get('/recordings', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/recordings', authMiddleware, upload.single('audio'), async (req, res) => {
+app.post('/recordings', authMiddleware, handleSoundUpload, async (req, res) => {
   try {
     const { name, mode, durationSec } = req.body;
 
