@@ -36,6 +36,7 @@ model Recording {
   mode        String?
   durationSec Int?
   sizeBytes   Int?
+  data        Bytes?   // саме аудіо (зберігаємо в базі, бо диск Render тимчасовий)
   userId    Int
   user      User     @relation(fields: [userId], references: [id])
   createdAt DateTime @default(now())
@@ -48,6 +49,7 @@ model Sound {
   author    String?  // автор (для звуків з Freesound)
   license   String?
   sourceUrl String?
+  data      Bytes?   // аудіо власного звуку (для звуків з Freesound порожнє)
   userId    Int
   user      User     @relation(fields: [userId], references: [id])
   createdAt DateTime @default(now())

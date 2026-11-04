@@ -25,14 +25,8 @@ const upload = multer({ dest: 'uploads/' });
 // Окремий завантажувач для власних звуків: зберігає розширення файлу,
 // обмежує розмір (10 МБ) і пропускає лише аудіофайли
 const soundUpload = multer({
-  storage: multer.diskStorage({
-    destination: 'uploads/',
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname).toLowerCase().slice(0, 8);
-      const unique = Date.now() + '-' + Math.round(Math.random() * 1e9);
-      cb(null, unique + ext);
-    },
-  }),
+  // файл лишається в пам'яті й зберігається в базі (диск Render очищується після перезапуску)
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('audio/')) cb(null, true);
@@ -53,6 +47,57 @@ function handleSoundUpload(req, res, next) {
     return res.status(500).json({ error: 'Щось пішло не так' });
   });
 }
+
+// Ім'я файлу: унікальне, з розширенням оригіналу
+function makeFileName(originalName) {
+  const ext = path.extname(originalName || '').toLowerCase().replace(/[^.a-z0-9]/g, '').slice(0, 8);
+  return Date.now() + '-' + Math.round(Math.random() * 1e9) + ext;
+}
+
+const AUDIO_TYPES = {
+  '.webm': 'audio/webm',
+  '.ogg': 'audio/ogg',
+  '.oga': 'audio/ogg',
+  '.m4a': 'audio/mp4',
+  '.mp4': 'audio/mp4',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.aac': 'audio/aac',
+  '.flac': 'audio/flac',
+};
+
+// Старі файли (завантажені до переходу на базу) лежать на диску — їх віддає express.static.
+// Нові беремо з бази. Підтримуємо Range, щоб працювала перемотка (Safari без цього не грає).
+app.get('/uploads/:name', async (req, res) => {
+  try {
+    const fileName = req.params.name;
+    let row = await prisma.recording.findFirst({ where: { fileName }, select: { data: true } });
+    if (!row || !row.data) row = await prisma.sound.findFirst({ where: { fileName }, select: { data: true } });
+    if (!row || !row.data) return res.status(404).json({ error: 'Файл не знайдено' });
+
+    const buf = Buffer.from(row.data);
+    const type = AUDIO_TYPES[path.extname(fileName).toLowerCase()] || 'application/octet-stream';
+    res.set({ 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Cache-Control': 'public, max-age=31536000, immutable' });
+
+    const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    if (range && (range[1] || range[2])) {
+      let start = range[1] ? parseInt(range[1], 10) : buf.length - parseInt(range[2], 10);
+      let end = range[1] && range[2] ? parseInt(range[2], 10) : buf.length - 1;
+      start = Math.max(0, start);
+      end = Math.min(end, buf.length - 1);
+      if (start > end) return res.status(416).set('Content-Range', `bytes */${buf.length}`).end();
+      res.status(206).set({ 'Content-Range': `bytes ${start}-${end}/${buf.length}`, 'Content-Length': end - start + 1 });
+      return res.end(buf.subarray(start, end + 1));
+    }
+    res.set('Content-Length', buf.length);
+    res.end(buf);
+  } catch (error) {
+    sendServerError(res, error);
+  }
+});
+
+// Список без самих байтів аудіо (вони важкі)
+const NO_DATA = { data: true };
 
 function sendServerError(res, error) {
   console.error(error);
@@ -346,6 +391,7 @@ app.delete('/presets/:id', authMiddleware, async (req, res) => {
 app.get('/recordings', authMiddleware, async (req, res) => {
   try {
     const recordings = await prisma.recording.findMany({
+      omit: NO_DATA,
       where: { userId: req.userId },
       orderBy: { createdAt: 'desc' },
     });
@@ -367,9 +413,11 @@ app.post('/recordings', authMiddleware, handleSoundUpload, async (req, res) => {
     const duration = parseInt(durationSec);
 
     const recording = await prisma.recording.create({
+      omit: NO_DATA,
       data: {
         name: name || 'Без назви',
-        fileName: req.file.filename,
+        fileName: makeFileName(req.file.originalname),
+        data: req.file.buffer,
         mode: mode || null,
         durationSec: Number.isFinite(duration) ? duration : null,
         sizeBytes: req.file.size,
@@ -402,6 +450,7 @@ app.put('/recordings/:id', authMiddleware, async (req, res) => {
     }
 
     const updated = await prisma.recording.update({
+      omit: NO_DATA,
       where: { id: recordingId },
       data: { name: name.trim() },
     });
@@ -448,6 +497,7 @@ app.get('/sounds', authMiddleware, async (req, res) => {
     if (type) where.type = type;
 
     const sounds = await prisma.sound.findMany({
+      omit: NO_DATA,
       where,
       orderBy: { createdAt: 'desc' },
     });
@@ -470,9 +520,11 @@ app.post('/sounds', authMiddleware, handleSoundUpload, async (req, res) => {
     }
 
     const sound = await prisma.sound.create({
+      omit: NO_DATA,
       data: {
         name: name || 'Без назви',
-        fileName: req.file.filename,
+        fileName: makeFileName(req.file.originalname),
+        data: req.file.buffer,
         type,
         userId: req.userId,
       },
@@ -569,6 +621,7 @@ app.post('/sounds/freesound', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Вкажи коректний тип звуку' });
     }
     const sound = await prisma.sound.create({
+      omit: NO_DATA,
       data: {
         name: String(name || 'Без назви').slice(0, 120),
         fileName: `fs:${fid}`,
