@@ -10,6 +10,8 @@ const { PrismaClient } = require('@prisma/client');
 const { OAuth2Client } = require('google-auth-library');
 require('dotenv').config();
 const authMiddleware = require('./middleware/auth');
+const { rateLimit } = require('./lib/rateLimit');
+const { validateRegistration, validateName, cleanEmail } = require('./lib/validators');
 
 const app = express();
 const prisma = new PrismaClient();
@@ -23,26 +25,6 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
-// Проста обмежувальна «лінійка» від підбору паролів: N спроб за вікно з однієї IP-адреси
-function rateLimit(max, windowMs) {
-  const hits = new Map();
-  setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of hits) if (v.reset < now) hits.delete(k);
-  }, windowMs).unref();
-  return (req, res, next) => {
-    const now = Date.now();
-    let h = hits.get(req.ip);
-    if (!h || h.reset < now) h = { count: 0, reset: now + windowMs };
-    h.count++;
-    hits.set(req.ip, h);
-    if (h.count > max) {
-      res.set('Retry-After', String(Math.ceil((h.reset - now) / 1000)));
-      return res.status(429).json({ error: 'Забагато спроб. Зачекай кілька хвилин і спробуй ще раз' });
-    }
-    next();
-  };
-}
 const authLimiter = rateLimit(15, 15 * 60 * 1000);
 
 // Скільки файлів може зберігати один користувач (аудіо лежить у базі, місце обмежене)
@@ -143,33 +125,11 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-
 app.post('/auth/register', authLimiter, async (req, res) => {
   try {
-    const body = req.body || {};
-    const fullName = typeof body.fullName === 'string' ? body.fullName.trim().replace(/\s+/g, ' ') : '';
-    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
-    const password = typeof body.password === 'string' ? body.password : '';
-
-    if (!fullName || !email || !password) {
-      return res.status(400).json({ error: 'Заповни всі поля' });
-    }
-    if (fullName.length < 2 || fullName.length > 60) {
-      return res.status(400).json({ error: 'Ім’я має містити від 2 до 60 символів' });
-    }
-    if (email.length > 254 || !EMAIL_RE.test(email)) {
-      return res.status(400).json({ error: 'Вкажи коректну адресу email' });
-    }
-    if (password.length < 8) {
-      return res.status(400).json({ error: 'Пароль має містити щонайменше 8 символів' });
-    }
-    if (Buffer.byteLength(password, 'utf8') > 72) {
-      return res.status(400).json({ error: 'Пароль занадто довгий (до 72 байтів)' });
-    }
-    if (!/[A-Za-zА-Яа-яІіЇїЄєҐґ]/.test(password) || !/\d/.test(password)) {
-      return res.status(400).json({ error: 'Пароль має містити літери та цифри' });
-    }
+    const checked = validateRegistration(req.body);
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    const { fullName, email, password } = checked.value;
 
     const existingUser = await prisma.user.findUnique({ where: { email } });
     if (existingUser) {
@@ -267,7 +227,7 @@ app.post('/auth/google', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Google не підтвердив email' });
     }
 
-    const gEmail = payload.email.trim().toLowerCase();
+    const gEmail = cleanEmail(payload.email);
     let user = await prisma.user.findUnique({ where: { email: gEmail } });
     if (!user && gEmail !== payload.email) user = await prisma.user.findUnique({ where: { email: payload.email } });
     if (!user) {
@@ -290,13 +250,9 @@ app.post('/auth/google', authLimiter, async (req, res) => {
 
 app.put('/auth/me', authMiddleware, async (req, res) => {
   try {
-    const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim().replace(/\s+/g, ' ') : '';
-    if (!fullName) {
-      return res.status(400).json({ error: 'Вкажи ім\'я' });
-    }
-    if (fullName.length < 2 || fullName.length > 60) {
-      return res.status(400).json({ error: 'Ім’я має містити від 2 до 60 символів' });
-    }
+    const checked = validateName(req.body?.fullName);
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    const fullName = checked.value;
     const user = await prisma.user.update({
       where: { id: req.userId },
       data: { fullName },
