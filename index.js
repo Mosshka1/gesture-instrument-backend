@@ -112,12 +112,32 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
 app.post('/auth/register', async (req, res) => {
   try {
-    const { fullName, email, password } = req.body;
+    const body = req.body || {};
+    const fullName = typeof body.fullName === 'string' ? body.fullName.trim().replace(/\s+/g, ' ') : '';
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const password = typeof body.password === 'string' ? body.password : '';
 
     if (!fullName || !email || !password) {
       return res.status(400).json({ error: 'Заповни всі поля' });
+    }
+    if (fullName.length < 2 || fullName.length > 60) {
+      return res.status(400).json({ error: 'Ім’я має містити від 2 до 60 символів' });
+    }
+    if (email.length > 254 || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: 'Вкажи коректну адресу email' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Пароль має містити щонайменше 8 символів' });
+    }
+    if (Buffer.byteLength(password, 'utf8') > 72) {
+      return res.status(400).json({ error: 'Пароль занадто довгий (до 72 байтів)' });
+    }
+    if (!/[A-Za-zА-Яа-яІіЇїЄєҐґ]/.test(password) || !/\d/.test(password)) {
+      return res.status(400).json({ error: 'Пароль має містити літери та цифри' });
     }
 
     const existingUser = await prisma.user.findUnique({ where: { email } });
@@ -145,13 +165,19 @@ app.post('/auth/register', async (req, res) => {
 
 app.post('/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const body = req.body || {};
+    const rawEmail = typeof body.email === 'string' ? body.email.trim() : '';
+    const password = typeof body.password === 'string' ? body.password : '';
 
-    if (!email || !password) {
+    if (!rawEmail || !password) {
       return res.status(400).json({ error: 'Заповни всі поля' });
     }
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    // старі акаунти могли зберегтись із великими літерами в email
+    let user = await prisma.user.findUnique({ where: { email: rawEmail } });
+    if (!user && rawEmail !== rawEmail.toLowerCase()) {
+      user = await prisma.user.findUnique({ where: { email: rawEmail.toLowerCase() } });
+    }
     if (!user) {
       return res.status(401).json({ error: 'Невірний email або пароль' });
     }
