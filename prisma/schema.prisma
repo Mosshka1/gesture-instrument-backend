@@ -36,6 +36,7 @@ model Recording {
   mode        String?
   durationSec Int?
   sizeBytes   Int?
+  shareToken  String?  @unique // публічне посилання на запис (якщо власник поділився)
   data        Bytes?   // саме аудіо (зберігаємо в базі, бо диск Render тимчасовий)
   userId    Int
   user      User     @relation(fields: [userId], references: [id])

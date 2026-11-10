@@ -541,6 +541,58 @@ app.put('/recordings/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// --- Публічне посилання на запис ---
+
+const SHARE_RE = /^[A-Za-z0-9_-]{8,32}$/;
+const publicLimiter = rateLimit(120, 15 * 60 * 1000);
+
+app.post('/recordings/:id/share', authMiddleware, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const rec = await prisma.recording.findUnique({ where: { id }, select: { id: true, userId: true, shareToken: true } });
+    if (!rec) return res.status(404).json({ error: 'Запис не знайдено' });
+    if (rec.userId !== req.userId) return res.status(403).json({ error: 'Це не твій запис' });
+    if (rec.shareToken) return res.json({ shareToken: rec.shareToken });
+    const shareToken = crypto.randomBytes(9).toString('base64url');
+    await prisma.recording.update({ where: { id }, data: { shareToken }, select: { id: true } });
+    res.json({ shareToken });
+  } catch (error) {
+    sendServerError(res, error);
+  }
+});
+
+app.delete('/recordings/:id/share', authMiddleware, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const rec = await prisma.recording.findUnique({ where: { id }, select: { id: true, userId: true } });
+    if (!rec) return res.status(404).json({ error: 'Запис не знайдено' });
+    if (rec.userId !== req.userId) return res.status(403).json({ error: 'Це не твій запис' });
+    await prisma.recording.update({ where: { id }, data: { shareToken: null }, select: { id: true } });
+    res.json({ ok: true });
+  } catch (error) {
+    sendServerError(res, error);
+  }
+});
+
+// Без входу: лише назва, режим, тривалість, ім'я автора (тільки перше слово) та файл
+app.get('/share/:token', publicLimiter, async (req, res) => {
+  try {
+    const token = req.params.token;
+    if (!SHARE_RE.test(token)) return res.status(404).json({ error: 'Посилання не діє' });
+    const rec = await prisma.recording.findUnique({
+      where: { shareToken: token },
+      select: { name: true, mode: true, durationSec: true, fileName: true, createdAt: true, user: { select: { fullName: true } } },
+    });
+    if (!rec) return res.status(404).json({ error: 'Посилання не діє' });
+    const author = String(rec.user?.fullName || '').trim().split(/\s+/)[0] || null;
+    res.json({
+      recording: { name: rec.name, mode: rec.mode, durationSec: rec.durationSec, fileName: rec.fileName, createdAt: rec.createdAt, author },
+    });
+  } catch (error) {
+    sendServerError(res, error);
+  }
+});
+
 app.delete('/recordings/:id', authMiddleware, async (req, res) => {
   try {
     const recordingId = parseInt(req.params.id);
