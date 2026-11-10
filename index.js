@@ -14,9 +14,40 @@ const authMiddleware = require('./middleware/auth');
 const app = express();
 const prisma = new PrismaClient();
 
+app.set('trust proxy', 1); // Render стоїть за проксі: потрібна справжня IP-адреса клієнта
+app.use((req, res, next) => {
+  res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin' });
+  next();
+});
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
+
+// Проста обмежувальна «лінійка» від підбору паролів: N спроб за вікно з однієї IP-адреси
+function rateLimit(max, windowMs) {
+  const hits = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (v.reset < now) hits.delete(k);
+  }, windowMs).unref();
+  return (req, res, next) => {
+    const now = Date.now();
+    let h = hits.get(req.ip);
+    if (!h || h.reset < now) h = { count: 0, reset: now + windowMs };
+    h.count++;
+    hits.set(req.ip, h);
+    if (h.count > max) {
+      res.set('Retry-After', String(Math.ceil((h.reset - now) / 1000)));
+      return res.status(429).json({ error: 'Забагато спроб. Зачекай кілька хвилин і спробуй ще раз' });
+    }
+    next();
+  };
+}
+const authLimiter = rateLimit(15, 15 * 60 * 1000);
+
+// Скільки файлів може зберігати один користувач (аудіо лежить у базі, місце обмежене)
+const MAX_RECORDINGS = 30;
+const MAX_SOUNDS = 30;
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -114,7 +145,7 @@ app.get('/health', (req, res) => {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', authLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     const fullName = typeof body.fullName === 'string' ? body.fullName.trim().replace(/\s+/g, ' ') : '';
@@ -163,7 +194,7 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', authLimiter, async (req, res) => {
   try {
     const body = req.body || {};
     const rawEmail = typeof body.email === 'string' ? body.email.trim() : '';
@@ -217,7 +248,7 @@ app.get('/auth/me', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/auth/google', async (req, res) => {
+app.post('/auth/google', authLimiter, async (req, res) => {
   try {
     const { credential } = req.body;
     if (!credential) {
@@ -236,12 +267,14 @@ app.post('/auth/google', async (req, res) => {
       return res.status(401).json({ error: 'Google не підтвердив email' });
     }
 
-    let user = await prisma.user.findUnique({ where: { email: payload.email } });
+    const gEmail = payload.email.trim().toLowerCase();
+    let user = await prisma.user.findUnique({ where: { email: gEmail } });
+    if (!user && gEmail !== payload.email) user = await prisma.user.findUnique({ where: { email: payload.email } });
     if (!user) {
       // Для входу через Google пароль не потрібен — зберігаємо випадковий, якого ніхто не знає
       const randomPassword = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
       user = await prisma.user.create({
-        data: { fullName: payload.name || payload.email, email: payload.email, password: randomPassword },
+        data: { fullName: String(payload.name || gEmail).slice(0, 60), email: gEmail, password: randomPassword },
       });
     }
 
@@ -257,16 +290,34 @@ app.post('/auth/google', async (req, res) => {
 
 app.put('/auth/me', authMiddleware, async (req, res) => {
   try {
-    const { fullName } = req.body;
-    if (!fullName || !fullName.trim()) {
+    const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim().replace(/\s+/g, ' ') : '';
+    if (!fullName) {
       return res.status(400).json({ error: 'Вкажи ім\'я' });
+    }
+    if (fullName.length < 2 || fullName.length > 60) {
+      return res.status(400).json({ error: 'Ім’я має містити від 2 до 60 символів' });
     }
     const user = await prisma.user.update({
       where: { id: req.userId },
-      data: { fullName: fullName.trim() },
+      data: { fullName },
       select: { id: true, fullName: true, email: true, createdAt: true },
     });
     res.json({ user });
+  } catch (error) {
+    sendServerError(res, error);
+  }
+});
+
+// Видалення акаунта разом з усіма даними (пресети, записи, звуки)
+app.delete('/auth/me', authMiddleware, async (req, res) => {
+  try {
+    await prisma.$transaction([
+      prisma.preset.deleteMany({ where: { userId: req.userId } }),
+      prisma.recording.deleteMany({ where: { userId: req.userId } }),
+      prisma.sound.deleteMany({ where: { userId: req.userId } }),
+      prisma.user.delete({ where: { id: req.userId } }),
+    ]);
+    res.json({ ok: true });
   } catch (error) {
     sendServerError(res, error);
   }
@@ -436,12 +487,16 @@ app.post('/recordings', authMiddleware, handleSoundUpload, async (req, res) => {
       return res.status(400).json({ error: 'Файл не завантажено' });
     }
 
+    if ((await prisma.recording.count({ where: { userId: req.userId } })) >= MAX_RECORDINGS) {
+      return res.status(400).json({ error: `Досягнуто ліміт — ${MAX_RECORDINGS} записів. Видали непотрібні у розділі «Записи»` });
+    }
+
     const duration = parseInt(durationSec);
 
     const recording = await prisma.recording.create({
       omit: NO_DATA,
       data: {
-        name: name || 'Без назви',
+        name: String(name || 'Без назви').trim().slice(0, 120) || 'Без назви',
         fileName: makeFileName(req.file.originalname),
         data: req.file.buffer,
         mode: mode || null,
@@ -470,15 +525,15 @@ app.put('/recordings/:id', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Це не твій запис' });
     }
 
-    const { name } = req.body;
-    if (!name || !name.trim()) {
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    if (!name) {
       return res.status(400).json({ error: 'Вкажи назву' });
     }
 
     const updated = await prisma.recording.update({
       omit: NO_DATA,
       where: { id: recordingId },
-      data: { name: name.trim() },
+      data: { name: name.slice(0, 120) },
     });
     res.json({ recording: updated });
   } catch (error) {
@@ -544,11 +599,14 @@ app.post('/sounds', authMiddleware, handleSoundUpload, async (req, res) => {
     if (!type || !['instrument', 'background'].includes(type)) {
       return res.status(400).json({ error: 'Вкажи коректний тип звуку' });
     }
+    if ((await prisma.sound.count({ where: { userId: req.userId } })) >= MAX_SOUNDS) {
+      return res.status(400).json({ error: `Досягнуто ліміт — ${MAX_SOUNDS} звуків. Видали непотрібні у розділі «Власні звуки»` });
+    }
 
     const sound = await prisma.sound.create({
       omit: NO_DATA,
       data: {
-        name: name || 'Без назви',
+        name: String(name || 'Без назви').trim().slice(0, 120) || 'Без назви',
         fileName: makeFileName(req.file.originalname),
         data: req.file.buffer,
         type,
@@ -643,6 +701,9 @@ app.post('/sounds/freesound', authMiddleware, async (req, res) => {
     const { freesoundId, name, type, author, license, sourceUrl } = req.body;
     const fid = parseInt(freesoundId);
     if (!fid) return res.status(400).json({ error: 'Невірний звук' });
+    if ((await prisma.sound.count({ where: { userId: req.userId } })) >= MAX_SOUNDS) {
+      return res.status(400).json({ error: `Досягнуто ліміт — ${MAX_SOUNDS} звуків. Видали непотрібні у розділі «Власні звуки»` });
+    }
     if (!type || !['instrument', 'background'].includes(type)) {
       return res.status(400).json({ error: 'Вкажи коректний тип звуку' });
     }
